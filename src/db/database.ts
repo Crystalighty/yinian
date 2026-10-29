@@ -124,6 +124,9 @@ export interface OKRKeyResult {
   recurrence_days: string | null; // e.g. "1,3,5" for specific days
   reminder_time: string | null; // HH:MM or null
   reset_cycle: string; // 'none'|'daily'|'weekly'|'monthly'
+  reset_period_key: string | null;
+  accumulated_value: number;
+  inherit_parent_schedule: number;
   min_daily_amount: number;
   today_date: string | null;
   source_type: 'game' | 'life' | null;
@@ -490,6 +493,12 @@ export function getDb(): Promise<SQLite.SQLiteDatabase> {
       try { await db.execAsync('ALTER TABLE okr_key_results ADD COLUMN recurrence_days TEXT'); } catch {}
       try { await db.execAsync('ALTER TABLE okr_key_results ADD COLUMN reminder_time TEXT'); } catch {}
       try { await db.execAsync("ALTER TABLE okr_key_results ADD COLUMN reset_cycle TEXT NOT NULL DEFAULT 'none'"); } catch {}
+      try { await db.execAsync('ALTER TABLE okr_key_results ADD COLUMN reset_period_key TEXT'); } catch {}
+      try { await db.execAsync('ALTER TABLE okr_key_results ADD COLUMN accumulated_value REAL NOT NULL DEFAULT 0'); } catch {}
+      try {
+        await db.execAsync('ALTER TABLE okr_key_results ADD COLUMN inherit_parent_schedule INTEGER NOT NULL DEFAULT 0');
+        await db.execAsync("UPDATE okr_key_results SET inherit_parent_schedule = 1 WHERE parent_id IS NOT NULL AND recurrence = 'none'");
+      } catch {}
       try { await db.execAsync('ALTER TABLE okr_key_results ADD COLUMN min_daily_amount REAL NOT NULL DEFAULT 0'); } catch {}
       // A nullable local calendar date keeps the feature backwards compatible:
       // existing tasks stay unplanned until the user explicitly adds them.
@@ -507,6 +516,11 @@ export function getDb(): Promise<SQLite.SQLiteDatabase> {
 
 function now(): string {
   return new Date().toISOString();
+}
+
+function insertedId(result: unknown): number {
+  const value = result as { lastInsertRowId?: number; insertId?: number } | null;
+  return Number(value?.lastInsertRowId ?? value?.insertId ?? 0);
 }
 
 // ---------- boxes ----------
@@ -566,7 +580,7 @@ export async function copyBox(id: number): Promise<void> {
       'INSERT INTO boxes (name, icon, todo_mode, created_at) VALUES (?, ?, 0, ?)',
       newName, box.icon, ts
     );
-    const newId = (result as any)?.insertId ?? 0;
+    const newId = insertedId(result);
     if (newId > 0) {
       await db.runAsync(
         `INSERT INTO life_items (box_id, content, tags, image_uri, weight, status, disabled, created_at)
@@ -653,7 +667,7 @@ export async function addThought(
   imageUri: string | null
 ): Promise<void> {
   const db = await getDb();
-  await db.runAsync(
+  const result = await db.runAsync(
     'INSERT INTO life_items (box_id, content, tags, image_uri, weight, status, created_at) VALUES (?, ?, ?, ?, 1, ?, ?)',
     boxId,
     content,
@@ -671,7 +685,7 @@ export async function updateThought(
   imageUri: string | null
 ): Promise<void> {
   const db = await getDb();
-  await db.runAsync(
+  const result = await db.runAsync(
     'UPDATE life_items SET content = ?, tags = ?, image_uri = ? WHERE id = ?',
     content,
     JSON.stringify(tags),
@@ -915,7 +929,7 @@ export async function deleteProgress(id: number): Promise<void> {
 export async function listRecords(gameId: number): Promise<GameRecord[]> {
   const db = await getDb();
   return db.getAllAsync<GameRecord>(
-    'SELECT * FROM game_records WHERE game_id = ? ORDER BY created_at DESC',
+    'SELECT * FROM game_records WHERE game_id = ? ORDER BY COALESCE(played_at, created_at) DESC, id DESC',
     gameId
   );
 }
@@ -938,6 +952,33 @@ export async function addRecord(gameId: number, content: string, opts?: { played
       await db.runAsync('UPDATE game_items SET last_played = ?, updated_at = ? WHERE id = ?', playedAt, now(), gameId);
     }
   }
+}
+
+export async function updateRecord(id: number, content: string, opts: { playedAt: string; durationSeconds: number }): Promise<void> {
+  const db = await getDb();
+  await db.withTransactionAsync(async () => {
+    const previous = await db.getFirstAsync<{ game_id: number; duration: number }>(
+      'SELECT game_id, COALESCE(duration, 0) AS duration FROM game_records WHERE id = ?', id
+    );
+    if (!previous) throw new Error('游戏记录不存在');
+    const durationSeconds = Math.max(0, Math.round(opts.durationSeconds || 0));
+    await db.runAsync(
+      'UPDATE game_records SET content = ?, played_at = ?, duration = ? WHERE id = ?',
+      content, opts.playedAt, durationSeconds, id
+    );
+    const delta = durationSeconds - Number(previous.duration || 0);
+    if (delta !== 0) {
+      await db.runAsync(
+        'UPDATE game_items SET play_time = MAX(0, CAST(COALESCE(play_time, 0) AS INTEGER) + ?), updated_at = ? WHERE id = ?',
+        delta, now(), previous.game_id
+      );
+    }
+    const latest = await db.getFirstAsync<{ played_at: string | null }>(
+      'SELECT played_at FROM game_records WHERE game_id = ? ORDER BY COALESCE(played_at, created_at) DESC, id DESC LIMIT 1',
+      previous.game_id
+    );
+    await db.runAsync('UPDATE game_items SET last_played = ?, updated_at = ? WHERE id = ?', latest?.played_at ?? opts.playedAt, now(), previous.game_id);
+  });
 }
 
 export async function deleteRecord(id: number): Promise<void> {
@@ -1078,7 +1119,9 @@ async function getOrCreateDefaultPeriod(startDate?: string | null, endDate?: str
       'INSERT INTO okr_periods (name, start_date, end_date, archived, created_at) VALUES (?, ?, ?, 0, ?)',
       name, startDate, endDate, now()
     );
-    return (result as any)?.insertId ?? 1;
+    const periodId = insertedId(result);
+    if (!periodId) throw new Error('创建目标周期失败');
+    return periodId;
   }
   // Find or create a default "长期" period
   const existing = await db.getFirstAsync<{ id: number }>(
@@ -1091,7 +1134,9 @@ async function getOrCreateDefaultPeriod(startDate?: string | null, endDate?: str
     'INSERT INTO okr_periods (name, start_date, end_date, archived, created_at) VALUES (?, ?, ?, 0, ?)',
     '长期', today, farEnd, now()
   );
-  return (result as any)?.insertId ?? 1;
+  const periodId = insertedId(result);
+  if (!periodId) throw new Error('创建目标周期失败');
+  return periodId;
 }
 
 export async function addOKRObjective(title: string, opts: AddObjectiveOpts = {}): Promise<void> {
@@ -1105,7 +1150,7 @@ export async function addOKRObjective(title: string, opts: AddObjectiveOpts = {}
     opts.projectType ?? null, opts.projectId ?? null,
     now()
   );
-  const objectiveId = (result as any)?.insertId ?? 0;
+  const objectiveId = insertedId(result);
   
   // If linked to a todo-mode box, sync pending items as tasks
   if (objectiveId > 0 && opts.projectType === 'box' && opts.projectId) {
@@ -1117,6 +1162,87 @@ export async function addOKRObjective(title: string, opts: AddObjectiveOpts = {}
       await syncBoxTodosToOKR(objectiveId, opts.projectId);
     }
   }
+}
+
+/** Create the built-in eight-week wrist and lower-limb rehabilitation plan. */
+export async function createRehabObjectiveTemplate(startDate?: string): Promise<number> {
+  const db = await getDb();
+  const start = startDate ? new Date(`${startDate}T00:00:00`) : new Date();
+  start.setHours(0, 0, 0, 0);
+  const end = new Date(start);
+  end.setDate(end.getDate() + 55);
+  const sd = formatLocalDate(start);
+  const ed = formatLocalDate(end);
+  const existingPlans = await db.getAllAsync<{ id: number; task_count: number }>(
+    `SELECT o.id, COUNT(kr.id) AS task_count
+     FROM okr_objectives o
+     LEFT JOIN okr_key_results kr ON kr.objective_id = o.id
+     WHERE o.title = '腿＋手腕居家康复（8周）' AND o.status != 'completed'
+     GROUP BY o.id`
+  );
+  // A complete template currently contains well over one hundred task rows.
+  // Anything smaller is a partial result left by an interrupted/older build
+  // and is safe to rebuild instead of permanently blocking the template.
+  if (existingPlans.some((plan) => Number(plan.task_count) >= 100)) {
+    throw new Error('已经有一份进行中的康复计划');
+  }
+  // Remove every incomplete copy left by older builds or interrupted creation.
+  for (const plan of existingPlans) {
+    await db.runAsync('DELETE FROM okr_key_results WHERE objective_id = ?', plan.id);
+    await db.runAsync('DELETE FROM okr_objectives WHERE id = ?', plan.id);
+  }
+
+  const periodId = await getOrCreateDefaultPeriod(sd, ed);
+  const notes = '每天28–30分钟；周三、周日休息。动作保持无痛或疼痛≤3/10，膝盖对准第二脚趾，手腕避开疼痛角度。若次日加重退回上一阶段；持续8周无改善或伴无力、麻木，请咨询康复治疗师或手外科。';
+  const result = await db.runAsync(
+    'INSERT INTO okr_objectives (period_id, title, description, status, game_id, start_date, end_date, notes, project_type, project_id, created_at) VALUES (?, ?, NULL, ?, NULL, ?, ?, ?, NULL, NULL, ?)',
+    periodId, '腿＋手腕居家康复（8周）', 'active', sd, ed, notes, now()
+  );
+  const objectiveId = insertedId(result);
+  if (!objectiveId) throw new Error('创建康复计划失败');
+
+  const plans = [
+    { day: 1, title: '周一｜手A＋腿A', note: '常规30分钟；若今天打羽毛球，可在任务菜单选择“按羽毛球方案完成”。', hand: '手A：肌腱滑动8次；无痛腕屈伸10次；等长腕屈/伸各5秒×5；旋前旋后10次；软球轻握5秒×10。', leg: '腿A：短足2×10（5秒）；蚌式2×12/侧；臀桥2×15（顶峰2秒）；单腿站2×20秒/侧。' },
+    { day: 2, title: '周二｜手B＋腿B', note: '常规30分钟；若今天打羽毛球，可在任务菜单选择“按羽毛球方案完成”。', hand: '手B：肌腱滑动8次；无痛腕尺桡偏10次；等长桡偏/尺偏各5秒×5；旋前旋后10次；肩胛后缩5秒×10。', leg: '腿B：靠墙静蹲3×30秒；慢速提踵3×12；弹力带侧向走2×10步/方向；坐姿伸膝3×12/侧。' },
+    { day: 4, title: '周四｜手A＋腿C', note: '常规30分钟；若今天打羽毛球，可在任务菜单选择“按羽毛球方案完成”。', hand: '手A：肌腱滑动8次；无痛腕屈伸10次；等长腕屈/伸各5秒×5；旋前旋后10次；软球轻握5秒×10。', leg: '腿C：短足2×10；侧卧髋外展2×12/侧；单腿臀桥2×8/侧；鸟狗2×8/侧；单腿站2×30秒/侧。' },
+    { day: 5, title: '周五｜手B＋腿D', note: '常规30分钟；若今天打羽毛球，可在任务菜单选择“按羽毛球方案完成”。', hand: '手B：肌腱滑动8次；无痛腕尺桡偏10次；等长桡偏/尺偏各5秒×5；旋前旋后10次；肩胛后缩5秒×10。', leg: '腿D：分腿蹲2×8/腿；单脚提踵2×8/侧；死虫2×8/侧；弹力带侧向走2×10步/方向；单腿站3×30秒/侧。' },
+    { day: 6, title: '周六｜有氧恢复', note: '常规30分钟；若今天打羽毛球，可在任务菜单选择“按羽毛球方案完成”。', hand: '手部：轻柔屈伸拉伸3分钟；避免疼痛角度。', leg: '有氧20分钟（快走/骑车/游泳）；短足2×10；单腿站3×30秒/侧；冷身3分钟。' },
+  ];
+  const badminton = '羽毛球替代：打球前热身5分钟；手部激活4分钟；腿部激活4分钟；打球后冷身5分钟。减少杀球和反手过度发力，手腕中立位，痛就停。';
+  const warmup = '踏步摆臂；踝泵；髋绕环；肩绕环；手腕无痛屈伸';
+  const cooldown = '小腿拉伸；髋屈肌拉伸；手腕轻柔屈伸拉伸；足底滚球';
+  try {
+    for (const plan of plans) {
+      const parentId = await addKeyResult(objectiveId, plan.title, 8, '', null, null, 1, null, {
+        taskType: 'normal', notes: `${plan.note}\n${badminton}`, startDate: sd, endDate: ed,
+        recurrence: 'weekly', recurrenceDays: String(plan.day),
+      });
+      for (const [title, detail] of [['热身', warmup], ['手部训练', plan.hand], ['腿部训练', plan.leg], ['冷身', cooldown]] as const) {
+        const categoryId = await addKeyResult(objectiveId, title, 8, '', null, null, 1, parentId, {
+          taskType: 'normal', notes: detail, startDate: sd, endDate: ed,
+          recurrence: 'weekly', recurrenceDays: String(plan.day), inheritParentSchedule: true,
+        });
+        const actions = detail
+          .replace(/^(手A|手B|腿A|腿B|腿C|腿D)：/, '')
+          .split('；')
+          .map((action) => action.trim())
+          .filter(Boolean);
+        for (const action of actions) {
+          const actionTitle = action.includes('：') ? action.slice(0, action.indexOf('：')) : action;
+          await addKeyResult(objectiveId, actionTitle, 8, '', null, null, 1, categoryId, {
+            taskType: 'normal', notes: action, startDate: sd, endDate: ed,
+            recurrence: 'weekly', recurrenceDays: String(plan.day), inheritParentSchedule: true,
+          });
+        }
+      }
+    }
+  } catch (error) {
+    // Never leave a broken plan visible when one of its many task inserts fails.
+    await db.runAsync('DELETE FROM okr_key_results WHERE objective_id = ?', objectiveId);
+    await db.runAsync('DELETE FROM okr_objectives WHERE id = ?', objectiveId);
+    throw error;
+  }
+  return objectiveId;
 }
 
 export async function updateObjective(
@@ -1165,6 +1291,9 @@ export async function deleteObjectiveOKR(id: number): Promise<void> {
 
 export async function listKeyResults(objectiveId: number): Promise<OKRKeyResult[]> {
   const db = await getDb();
+  await applyScheduledResets(objectiveId);
+  await applyInheritedSchedules(objectiveId);
+  await normalizeRecurringTargets(objectiveId);
   return db.getAllAsync<OKRKeyResult>(
     'SELECT * FROM okr_key_results WHERE objective_id = ? AND parent_id IS NULL ORDER BY sort_order ASC, created_at ASC',
     objectiveId
@@ -1173,6 +1302,9 @@ export async function listKeyResults(objectiveId: number): Promise<OKRKeyResult[
 
 export async function listAllKeyResults(objectiveId: number): Promise<OKRKeyResult[]> {
   const db = await getDb();
+  await applyScheduledResets(objectiveId);
+  await applyInheritedSchedules(objectiveId);
+  await normalizeRecurringTargets(objectiveId);
   return db.getAllAsync<OKRKeyResult>(
     'SELECT * FROM okr_key_results WHERE objective_id = ? ORDER BY sort_order ASC, created_at ASC',
     objectiveId
@@ -1181,6 +1313,8 @@ export async function listAllKeyResults(objectiveId: number): Promise<OKRKeyResu
 
 export async function listSubKeyResults(parentId: number): Promise<OKRKeyResult[]> {
   const db = await getDb();
+  const parent = await db.getFirstAsync<{ objective_id: number }>('SELECT objective_id FROM okr_key_results WHERE id = ?', parentId);
+  if (parent) await applyScheduledResets(parent.objective_id);
   return db.getAllAsync<OKRKeyResult>(
     'SELECT * FROM okr_key_results WHERE parent_id = ? ORDER BY sort_order ASC, created_at ASC',
     parentId
@@ -1206,6 +1340,8 @@ export async function addKeyResult(
     reminderTime?: string | null;
     resetCycle?: string;
     minDailyAmount?: number;
+    initialValue?: number;
+    inheritParentSchedule?: boolean;
   }
 ): Promise<number> {
   const db = await getDb();
@@ -1238,13 +1374,17 @@ export async function addKeyResult(
   const reminderTime = opts?.reminderTime ?? null;
   const resetCycle = opts?.resetCycle ?? 'none';
   const minDailyAmount = opts?.minDailyAmount ?? 0;
+  const initialValue = Math.max(0, Math.min(targetValue, opts?.initialValue ?? 0));
+  const resetPeriodKey = resetCycle === 'none' ? null : getResetPeriodKey(resetCycle, new Date());
+  const inheritParentSchedule = parentId && opts?.inheritParentSchedule ? 1 : 0;
   const result = await db.runAsync(
-    `INSERT INTO okr_key_results (objective_id, parent_id, title, target_value, current_value, unit, repeat_mode, sort_order, source_type, source_id, task_type, notes, start_date, end_date, recurrence, recurrence_days, reminder_time, reset_cycle, min_daily_amount, created_at)
-     VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    objectiveId, parentId, title, targetValue, unit, repeatMode, sortOrder, sourceType, sourceId,
-    taskType, notes, startDate, endDate, recurrence, recurrenceDays, reminderTime, resetCycle, minDailyAmount, now()
+    `INSERT INTO okr_key_results (objective_id, parent_id, title, target_value, current_value, unit, repeat_mode, sort_order, source_type, source_id, task_type, notes, start_date, end_date, recurrence, recurrence_days, reminder_time, reset_cycle, reset_period_key, min_daily_amount, inherit_parent_schedule, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    objectiveId, parentId, title, targetValue, initialValue, unit, repeatMode, sortOrder, sourceType, sourceId,
+    taskType, notes, startDate, endDate, recurrence, recurrenceDays, reminderTime, resetCycle, resetPeriodKey, minDailyAmount, inheritParentSchedule, now()
   );
-  const krId = (result as any)?.insertId ?? 0;
+  const krId = insertedId(result);
+  if (!krId) throw new Error('创建任务失败');
   // Sync to game if objective is linked to a game
   if (!parentId && krId > 0) {
     await syncOKRKeyResultToGame(krId, objectiveId, title, targetValue, unit, repeatMode);
@@ -1346,34 +1486,80 @@ export async function updateKeyResult(
     reminderTime?: string | null;
     resetCycle?: string;
     minDailyAmount?: number;
+    inheritParentSchedule?: boolean;
   }
 ): Promise<void> {
   const db = await getDb();
-  await db.runAsync(
+  const previous = await db.getFirstAsync<{ reset_cycle: string; reset_period_key: string | null }>('SELECT reset_cycle, reset_period_key FROM okr_key_results WHERE id = ?', id);
+  const nextResetCycle = opts?.resetCycle ?? 'none';
+  const resetPeriodKey = nextResetCycle === 'none' ? null : getResetPeriodKey(nextResetCycle, new Date());
+  const result = await db.runAsync(
     `UPDATE okr_key_results SET title = ?, target_value = ?, unit = ?, repeat_mode = ?,
-     source_type = ?, source_id = ?, task_type = COALESCE(?, task_type),
-     notes = COALESCE(?, notes), start_date = COALESCE(?, start_date),
-     end_date = COALESCE(?, end_date), recurrence = COALESCE(?, recurrence),
-     recurrence_days = COALESCE(?, recurrence_days), reminder_time = COALESCE(?, reminder_time),
-     reset_cycle = COALESCE(?, reset_cycle), min_daily_amount = COALESCE(?, min_daily_amount)
+     source_type = ?, source_id = ?, task_type = ?, notes = ?, start_date = ?,
+     end_date = ?, recurrence = ?, recurrence_days = ?, reminder_time = ?,
+     reset_cycle = ?, reset_period_key = ?, min_daily_amount = ?, inherit_parent_schedule = ?
      WHERE id = ?`,
     title, targetValue, unit, repeatMode,
     sourceType, sourceId,
-    opts?.taskType ?? null,
-    opts?.notes !== undefined ? opts.notes : null,
-    opts?.startDate !== undefined ? opts.startDate : null,
-    opts?.endDate !== undefined ? opts.endDate : null,
-    opts?.recurrence ?? null,
-    opts?.recurrenceDays !== undefined ? opts.recurrenceDays : null,
-    opts?.reminderTime !== undefined ? opts.reminderTime : null,
-    opts?.resetCycle ?? null,
-    opts?.minDailyAmount ?? null,
+    opts?.taskType ?? 'normal', opts?.notes ?? null, opts?.startDate ?? null,
+    opts?.endDate ?? null, opts?.recurrence ?? 'none', opts?.recurrenceDays ?? null,
+    opts?.reminderTime ?? null, nextResetCycle,
+    previous?.reset_cycle === nextResetCycle ? previous?.reset_period_key ?? resetPeriodKey : resetPeriodKey,
+    opts?.minDailyAmount ?? 0, opts?.inheritParentSchedule ? 1 : 0,
     id
   );
+  if ((result as any).changes === 0) throw new Error('没有找到要编辑的任务');
+  await cascadeInheritedSchedule(id);
+}
+
+async function cascadeInheritedSchedule(parentId: number): Promise<void> {
+  const db = await getDb();
+  const parent = await db.getFirstAsync<OKRKeyResult>('SELECT * FROM okr_key_results WHERE id = ?', parentId);
+  if (!parent) return;
+  const children = await db.getAllAsync<OKRKeyResult>(
+    'SELECT * FROM okr_key_results WHERE parent_id = ? AND inherit_parent_schedule = 1', parentId
+  );
+  for (const child of children) {
+    const inherited = { ...child, start_date: parent.start_date, end_date: parent.end_date, recurrence: parent.recurrence, recurrence_days: parent.recurrence_days };
+    const target = parent.recurrence === 'none' ? 1 : calcNormalTaskQuantity(inherited);
+    await db.runAsync(
+      `UPDATE okr_key_results SET start_date = ?, end_date = ?, recurrence = ?, recurrence_days = ?,
+       repeat_mode = ?, target_value = ?, current_value = MIN(current_value, ?) WHERE id = ?`,
+      parent.start_date, parent.end_date, parent.recurrence, parent.recurrence_days,
+      parent.recurrence === 'none' ? 0 : 1, target, target, child.id
+    );
+    await cascadeInheritedSchedule(child.id);
+  }
+}
+
+async function applyInheritedSchedules(objectiveId: number): Promise<void> {
+  const db = await getDb();
+  const roots = await db.getAllAsync<{ id: number }>(
+    'SELECT id FROM okr_key_results WHERE objective_id = ? AND parent_id IS NULL', objectiveId
+  );
+  for (const root of roots) await cascadeInheritedSchedule(root.id);
+}
+
+async function normalizeRecurringTargets(objectiveId: number): Promise<void> {
+  const db = await getDb();
+  const tasks = await db.getAllAsync<OKRKeyResult>(
+    "SELECT * FROM okr_key_results WHERE objective_id = ? AND task_type = 'normal' AND recurrence != 'none'",
+    objectiveId
+  );
+  for (const task of tasks) {
+    const target = calcNormalTaskQuantity(task);
+    if (Number(task.target_value) !== target) {
+      await db.runAsync(
+        'UPDATE okr_key_results SET target_value = ?, current_value = MIN(current_value, ?) WHERE id = ?',
+        target, target, task.id
+      );
+    }
+  }
 }
 
 export async function updateKRProgress(id: number, currentValue: number): Promise<void> {
   const db = await getDb();
+  await applyScheduledResetForTask(id);
   const safeValue = Number.isFinite(currentValue) ? currentValue : 0;
   await db.runAsync(
     'UPDATE okr_key_results SET current_value = MIN(MAX(0, ?), MAX(0, target_value)) WHERE id = ?',
@@ -1408,6 +1594,14 @@ export async function toggleKRRepeat(id: number, repeatMode: number): Promise<vo
 
 export async function incrementKR(id: number): Promise<void> {
   const db = await getDb();
+  await applyScheduledResetForTask(id);
+  const task = await db.getFirstAsync<OKRKeyResult>('SELECT * FROM okr_key_results WHERE id = ?', id);
+  if (!task) throw new Error('任务不存在');
+  const today = formatLocalDate(new Date());
+  if (task.task_type !== 'progress' && task.recurrence && task.recurrence !== 'none') {
+    const dueCount = countScheduledOccurrencesThroughDate(task, new Date());
+    if (Number(task.current_value) >= dueCount) throw new Error('当前没有待完成的循环次数');
+  }
   await db.runAsync(
     'UPDATE okr_key_results SET current_value = MIN(current_value + 1, MAX(0, target_value)) WHERE id = ?',
     id
@@ -1417,7 +1611,6 @@ export async function incrementKR(id: number): Promise<void> {
     'SELECT objective_id FROM okr_key_results WHERE id = ?', id
   );
   if (kr) {
-    const today = new Date().toISOString().slice(0, 10);
     await db.runAsync(
       'INSERT INTO okr_activity_log (objective_id, key_result_id, date, created_at) VALUES (?, ?, ?, ?)',
       kr.objective_id, id, today, now()
@@ -1427,14 +1620,140 @@ export async function incrementKR(id: number): Promise<void> {
   await syncOKRTaskToLifeItem(id);
 }
 
+/** Complete one due occurrence for every leaf below a recurring parent task. */
+export async function completeRecurringTaskTree(id: number): Promise<void> {
+  const db = await getDb();
+  const descendants = await db.getAllAsync<OKRKeyResult>(
+    `WITH RECURSIVE tree(id) AS (
+       SELECT id FROM okr_key_results WHERE parent_id = ?
+       UNION ALL
+       SELECT child.id FROM okr_key_results child JOIN tree parent ON child.parent_id = parent.id
+     )
+     SELECT task.* FROM tree
+     JOIN okr_key_results task ON task.id = tree.id
+     LEFT JOIN okr_key_results child ON child.parent_id = tree.id
+     WHERE child.id IS NULL`, id
+  );
+  if (descendants.length === 0) {
+    await incrementKR(id);
+    return;
+  }
+  let completedCount = 0;
+  const today = new Date();
+  for (const task of descendants) {
+    const dueCount = countScheduledOccurrencesThroughDate(task, today);
+    if (Number(task.current_value) < dueCount) {
+      await incrementKR(task.id);
+      completedCount++;
+    }
+  }
+  if (completedCount === 0) throw new Error('当前没有待完成的训练任务');
+}
+
+function formatLocalDate(date: Date): string {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+
+function isScheduledOccurrence(task: OKRKeyResult, date: Date): boolean {
+  const dateText = formatLocalDate(date);
+  if ((task.start_date && dateText < task.start_date) || (task.end_date && dateText > task.end_date)) return false;
+  const weekday = date.getDay() || 7;
+  if (task.recurrence === 'daily') return true;
+  if (task.recurrence === 'weekday') return weekday <= 5;
+  if (task.recurrence === 'weekend') return weekday >= 6;
+  if (task.recurrence === 'weekly') return new Set((task.recurrence_days || '').split(',').map(Number)).has(weekday);
+  if (task.recurrence === 'monthly') return new Set((task.recurrence_days || '').split(',').map(Number)).has(date.getDate());
+  if (task.recurrence === 'ebbinghaus' && task.start_date) {
+    const start = new Date(`${task.start_date}T00:00:00`);
+    const current = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+    const offset = Math.round((current.getTime() - start.getTime()) / 86400000);
+    return [0, 1, 3, 6, 14, 29].includes(offset);
+  }
+  return false;
+}
+
+function countScheduledOccurrencesThroughDate(task: OKRKeyResult, date: Date): number {
+  if (!task.start_date) return 0;
+  const start = new Date(`${task.start_date}T00:00:00`);
+  const requestedEnd = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  const configuredEnd = task.end_date ? new Date(`${task.end_date}T00:00:00`) : requestedEnd;
+  const end = requestedEnd < configuredEnd ? requestedEnd : configuredEnd;
+  if (end < start) return 0;
+  let count = 0;
+  for (const cursor = new Date(start); cursor <= end; cursor.setDate(cursor.getDate() + 1)) {
+    if (isScheduledOccurrence(task, cursor)) count++;
+  }
+  return count;
+}
+
+function localDateParts(date: Date): { year: number; month: number; day: number } {
+  return { year: date.getFullYear(), month: date.getMonth() + 1, day: date.getDate() };
+}
+
+function getResetPeriodKey(cycle: string, date: Date): string {
+  const { year, month, day } = localDateParts(date);
+  if (cycle === 'daily') return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+  if (cycle === 'monthly') return `${year}-${String(month).padStart(2, '0')}`;
+  if (cycle === 'weekly') {
+    const d = new Date(year, month - 1, day);
+    const weekday = d.getDay() || 7;
+    d.setDate(d.getDate() + 4 - weekday);
+    const first = new Date(d.getFullYear(), 0, 1);
+    const week = Math.ceil((((d.getTime() - first.getTime()) / 86400000) + 1) / 7);
+    return `${d.getFullYear()}-W${String(week).padStart(2, '0')}`;
+  }
+  return 'none';
+}
+
+async function applyScheduledResetForTask(id: number, date = new Date()): Promise<void> {
+  const db = await getDb();
+  const kr = await db.getFirstAsync<{ reset_cycle: string; reset_period_key: string | null }>(
+    'SELECT reset_cycle, reset_period_key FROM okr_key_results WHERE id = ?', id
+  );
+  if (!kr || !kr.reset_cycle || kr.reset_cycle === 'none') return;
+  const currentKey = getResetPeriodKey(kr.reset_cycle, date);
+  if (kr.reset_period_key !== currentKey) {
+    await db.runAsync('UPDATE okr_key_results SET accumulated_value = accumulated_value + current_value, current_value = 0, reset_period_key = ? WHERE id = ?', currentKey, id);
+  }
+}
+
+async function applyScheduledResets(objectiveId: number, date = new Date()): Promise<void> {
+  const db = await getDb();
+  const tasks = await db.getAllAsync<{ id: number; reset_cycle: string; reset_period_key: string | null }>(
+    "SELECT id, reset_cycle, reset_period_key FROM okr_key_results WHERE objective_id = ? AND task_type = 'progress' AND reset_cycle != 'none'",
+    objectiveId
+  );
+  for (const task of tasks) {
+    const currentKey = getResetPeriodKey(task.reset_cycle, date);
+    if (task.reset_period_key !== currentKey) {
+      await db.runAsync('UPDATE okr_key_results SET accumulated_value = accumulated_value + current_value, current_value = 0, reset_period_key = ? WHERE id = ?', currentKey, task.id);
+    }
+  }
+}
+
 export async function addKRProgressRecord(id: number, date: string, amount: number): Promise<void> {
   if (!Number.isFinite(amount) || amount === 0) throw new Error('进度值不能为 0');
   const db = await getDb();
+  await applyScheduledResetForTask(id);
   await db.withTransactionAsync(async () => {
-    const kr = await db.getFirstAsync<{ objective_id: number; current_value: number; target_value: number }>(
-      'SELECT objective_id, current_value, target_value FROM okr_key_results WHERE id = ?', id
+    const kr = await db.getFirstAsync<{ objective_id: number; current_value: number; target_value: number; reset_cycle: string; reset_period_key: string | null; accumulated_value: number }>(
+      'SELECT objective_id, current_value, target_value, reset_cycle, reset_period_key, accumulated_value FROM okr_key_results WHERE id = ?', id
     );
     if (!kr) throw new Error('任务不存在');
+    const recordPeriodKey = kr.reset_cycle && kr.reset_cycle !== 'none'
+      ? getResetPeriodKey(kr.reset_cycle, new Date(`${date}T12:00:00`))
+      : kr.reset_period_key;
+    if (kr.reset_cycle !== 'none' && recordPeriodKey !== kr.reset_period_key) {
+      const nextAccumulated = Math.max(0, Number(kr.accumulated_value || 0) + amount);
+      const appliedAmount = nextAccumulated - Number(kr.accumulated_value || 0);
+      if (appliedAmount === 0) throw new Error('历史累计进度已经是 0');
+      await db.runAsync('UPDATE okr_key_results SET accumulated_value = ? WHERE id = ?', nextAccumulated, id);
+      await db.runAsync(
+        'INSERT INTO okr_activity_log (objective_id, key_result_id, date, amount, created_at) VALUES (?, ?, ?, ?, ?)',
+        kr.objective_id, id, date, appliedAmount, now()
+      );
+      return;
+    }
     const nextValue = Math.max(0, Math.min(Number(kr.target_value), Number(kr.current_value) + amount));
     const appliedAmount = nextValue - Number(kr.current_value);
     if (appliedAmount === 0) throw new Error(amount > 0 ? '当前进度已达到目标' : '当前进度已经是 0');
@@ -1708,7 +2027,10 @@ export function calcNormalTaskQuantity(kr: OKRKeyResult): number {
   if (recurrence === 'weekend') return countWeekends(startDate, endDate);
   if (recurrence === 'weekly' && kr.recurrence_days) return countSpecificWeekdays(startDate, endDate, kr.recurrence_days);
   if (recurrence === 'monthly' && kr.recurrence_days) return countSpecificMonthDays(startDate, endDate, kr.recurrence_days);
-  if (recurrence === 'ebbinghaus') return 6;
+  if (recurrence === 'ebbinghaus') {
+    const availableDays = daysBetween(startDate, endDate);
+    return [1, 2, 4, 7, 15, 30].filter((day) => day <= availableDays).length || 1;
+  }
   return 1;
 }
 
@@ -1756,6 +2078,9 @@ export function calcTaskDone(kr: OKRKeyResult, allKrs: OKRKeyResult[]): number {
   if (subtasks.length > 0) {
     return subtasks.reduce((sum, sub) => sum + calcTaskDone(sub, allKrs), 0);
   }
+  if (kr.task_type === 'progress' && kr.reset_cycle && kr.reset_cycle !== 'none') {
+    return (kr.accumulated_value || 0) + (kr.current_value || 0);
+  }
   return kr.current_value || 0;
 }
 
@@ -1766,8 +2091,9 @@ export async function getAllObjectivesWithProgress(): Promise<(OKRObjective & { 
   const rows = await db.getAllAsync<OKRObjective & { period_end_date: string; period_name: string }>(
     `SELECT o.*,
             COALESCE(o.end_date, p.end_date, '') AS period_end_date,
-            CASE WHEN o.start_date AND o.end_date THEN o.start_date || ' ~ ' || o.end_date
-                 ELSE COALESCE(p.name, '长期') END AS period_name
+            CASE WHEN o.start_date IS NOT NULL AND o.end_date IS NOT NULL
+                 THEN o.start_date || ' ~ ' || o.end_date
+                 ELSE '长期目标' END AS period_name
      FROM okr_objectives o
      LEFT JOIN okr_periods p ON o.period_id = p.id
      ORDER BY o.created_at DESC`
@@ -1795,7 +2121,12 @@ export async function getAllObjectivesWithProgress(): Promise<(OKRObjective & { 
     }
 
     const progress = totalQuantity > 0 ? Math.round((totalDone / totalQuantity) * 100) : 0;
-    result.push({ ...obj, progress, kr_count: krCount, kr_done: krDone });
+    let status = obj.status;
+    if (status === 'active' && krCount > 0 && progress >= 100) {
+      await db.runAsync("UPDATE okr_objectives SET status = 'completed' WHERE id = ?", obj.id);
+      status = 'completed';
+    }
+    result.push({ ...obj, status, progress, kr_count: krCount, kr_done: krDone });
   }
   return result;
 }

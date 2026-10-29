@@ -26,6 +26,7 @@ import {
   deleteObjective,
   deleteProgress,
   deleteRecord,
+  updateRecord,
   getGame,
   listObjectives,
   listProgress,
@@ -113,6 +114,8 @@ export default function GameDetailScreen() {
   const [recordDate, setRecordDate] = useState(new Date());
   const [recordPickerMode, setRecordPickerMode] = useState<'date' | 'time' | null>(null);
   const [recordDuration, setRecordDuration] = useState('');
+  const [editingRecordId, setEditingRecordId] = useState<number | null>(null);
+  const [showAllRecords, setShowAllRecords] = useState(false);
   const [timerRecord, setTimerRecord] = useState<{ seconds: number; playedAt: string; fallback: string } | null>(null);
   const [objectives, setObjectives] = useState<GameObjective[]>([]);
   const [addObjVisible, setAddObjVisible] = useState(false);
@@ -241,23 +244,22 @@ export default function GameDetailScreen() {
   };
 
   const saveRecord = async () => {
-    if (!recordContent.trim() && !timerRecord) {
-      Alert.alert('提示', '记录内容不能为空');
-      return;
-    }
     // recordDate 对手动新增默认为当前时间，对计时器记录为精确结束时间，统一保存至时分
     const playedAt = fmtDateTime(recordDate);
     const durationHours = parseFloat(recordDuration) || 0;
     const durationSeconds = timerRecord?.seconds ?? Math.round(durationHours * 3600);
-    await addRecord(gameId, recordContent.trim() || timerRecord!.fallback, {
-      playedAt,
-      durationSeconds,
-    });
+    const content = recordContent.trim() || timerRecord?.fallback || '';
+    if (editingRecordId) {
+      await updateRecord(editingRecordId, content, { playedAt, durationSeconds });
+    } else {
+      await addRecord(gameId, content, { playedAt, durationSeconds });
+    }
     setRecordContent('');
     setRecordDuration('');
     setRecordDate(new Date());
     setRecordVisible(false);
     setTimerRecord(null);
+    setEditingRecordId(null);
     refresh();
   };
 
@@ -267,7 +269,16 @@ export default function GameDetailScreen() {
       setTimerRecord(null);
       await refresh();
     }
-    setRecordVisible(false); setRecordContent(''); setRecordDuration('');
+    setRecordVisible(false); setRecordContent(''); setRecordDuration(''); setEditingRecordId(null);
+  };
+
+  const openEditRecord = (record: GameRecord) => {
+    setEditingRecordId(record.id);
+    setRecordContent(record.content || '');
+    setRecordDuration(record.duration > 0 ? String(Number((record.duration / 3600).toFixed(2))) : '');
+    setRecordDate(new Date((record.played_at || record.created_at).replace(' ', 'T')));
+    setTimerRecord(null);
+    setRecordVisible(true);
   };
 
   const saveObjective = async () => {
@@ -535,7 +546,7 @@ export default function GameDetailScreen() {
         <View style={styles.section}>
           <View style={styles.sectionHeader}>
             <View><Text style={styles.sectionTitle}>游玩记录</Text><Text style={styles.sectionSubtitle}>留下每一次游玩的片段</Text></View>
-            <Pressable style={styles.addTaskButton} onPress={() => { setRecordDate(new Date()); setRecordVisible(true); }}>
+            <Pressable style={styles.addTaskButton} onPress={() => { setEditingRecordId(null); setRecordContent(''); setRecordDuration(''); setRecordDate(new Date()); setRecordVisible(true); }}>
               <Text style={styles.addTaskBtn}>＋ 新增</Text>
             </Pressable>
           </View>
@@ -543,10 +554,10 @@ export default function GameDetailScreen() {
             <Text style={styles.emptyTask}>还没有记录，点击上方添加</Text>
           ) : (
             <View style={styles.timeline}>
-              {records.map((record, index) => (
+              {(showAllRecords ? records : records.slice(0, 10)).map((record, index, visibleRecords) => (
                 <View key={record.id} style={styles.timelineItem}>
                   <View style={styles.timelineDot} />
-                  {index < records.length - 1 ? <View style={styles.timelineLine} /> : null}
+                  {index < visibleRecords.length - 1 ? <View style={styles.timelineLine} /> : null}
                   <View style={styles.timelineCard}>
                     <View style={styles.timelineTop}>
                       <Text style={styles.timelineDate}>
@@ -559,14 +570,22 @@ export default function GameDetailScreen() {
                             : `${Math.round(record.duration / 60)}分钟`}
                         </Text>
                       ) : null}
-                      <Pressable onPress={() => confirmDeleteRecord(record)}>
+                      <Pressable onPress={() => openEditRecord(record)} hitSlop={8}>
+                        <Text style={styles.recordEdit}>编辑</Text>
+                      </Pressable>
+                      <Pressable onPress={() => confirmDeleteRecord(record)} hitSlop={8}>
                         <Text style={styles.taskDelete}>🗑️</Text>
                       </Pressable>
                     </View>
-                    <Text style={styles.timelineContent}>{record.content}</Text>
+                    {record.content ? <Text style={styles.timelineContent}>{record.content}</Text> : null}
                   </View>
                 </View>
               ))}
+              {records.length > 10 && (
+                <Pressable style={styles.recordsToggle} onPress={() => setShowAllRecords((value) => !value)}>
+                  <Text style={styles.recordsToggleText}>{showAllRecords ? '收起记录' : `展开其余 ${records.length - 10} 条记录`}</Text>
+                </Pressable>
+              )}
             </View>
           )}
         </View>
@@ -669,7 +688,7 @@ export default function GameDetailScreen() {
       <KeyboardAvoidingView style={styles.modalMask} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
         <ScrollView style={styles.form} contentContainerStyle={styles.formContent} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
           <View style={styles.formHeader}>
-            <Text style={styles.formTitle}>{timerRecord ? '记录本次游玩' : '新增游戏记录'}</Text>
+            <Text style={styles.formTitle}>{timerRecord ? '记录本次游玩' : editingRecordId ? '编辑游戏记录' : '新增游戏记录'}</Text>
             <Pressable
               onPress={closeRecordModal}
             >
@@ -678,7 +697,7 @@ export default function GameDetailScreen() {
           </View>
           <TextInput
             style={[styles.formInput, { minHeight: 80, textAlignVertical: 'top' }]}
-            placeholder={timerRecord ? '这次玩到哪里了？有什么感受？（可跳过）' : '记录你的游戏心得…'}
+            placeholder={timerRecord ? '这次玩到哪里了？有什么感受？（可跳过）' : '备注/心得（选填）'}
             value={recordContent}
             onChangeText={setRecordContent}
             multiline
@@ -1061,7 +1080,10 @@ const styles = StyleSheet.create({
   },
   timelineDate: { fontSize: 12, color: colors.subtext },
   timelineDuration: { fontSize: 12, color: colors.orange, fontWeight: '600' },
+  recordEdit: { fontSize: 12, color: colors.orangeDark, fontWeight: '700', paddingHorizontal: 4 },
   timelineContent: { fontSize: 14, color: colors.text, lineHeight: 20 },
+  recordsToggle: { alignSelf: 'center', marginTop: 4, paddingHorizontal: 18, paddingVertical: 10, borderRadius: 12, backgroundColor: colors.surfaceMuted },
+  recordsToggleText: { fontSize: 12, color: colors.orangeDark, fontWeight: '700' },
   timerSection: {
     width: '100%',
     backgroundColor: colors.card,

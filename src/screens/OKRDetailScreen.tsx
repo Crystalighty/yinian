@@ -23,6 +23,7 @@ import {
   getObjective,
   getOKRActivityCounts,
   incrementKR,
+  completeRecurringTaskTree,
   listKeyResults,
   listSubKeyResults,
   syncAllKRForObjective,
@@ -250,38 +251,6 @@ export default function OKRDetailScreen() {
     ]);
   };
 
-  // Top +1 button: increment first incomplete repeat task, or complete first normal task
-  const handleTopIncrement = async () => {
-    const firstProgress = incompleteTasks.find((kr) => kr.task_type === 'progress');
-    if (firstProgress) {
-      openProgressRecord(firstProgress);
-      return;
-    }
-    const firstRepeat = incompleteTasks.find((kr) => kr.repeat_mode === 1);
-    if (firstRepeat) {
-      await incrementKR(firstRepeat.id);
-      refresh();
-      return;
-    }
-    const firstNormal = incompleteTasks.find((kr) => kr.repeat_mode !== 1);
-    if (firstNormal) {
-      await updateKRProgress(firstNormal.id, 1);
-      refresh();
-    }
-  };
-
-  const handleTopDecrement = async () => {
-    const candidates = [...keyResults].reverse();
-    const task = candidates.find((kr) => Number(kr.current_value) > 0);
-    if (!task) return;
-    if (task.task_type === 'progress') {
-      openProgressRecord(task, -1);
-      return;
-    }
-    await updateKRProgress(task.id, Math.max(0, Number(task.current_value) - 1));
-    await refresh();
-  };
-
   // Add task → navigate to dedicated form
   const openAddTask = () => {
     (navigation as any).navigate('OKRTaskForm', { objectiveId });
@@ -352,7 +321,7 @@ export default function OKRDetailScreen() {
 
   // Edit task → navigate to dedicated form
   const openEditTask = (kr: OKRKeyResult) => {
-    (navigation as any).navigate('OKRTaskForm', { objectiveId, taskId: kr.id });
+    (navigation as any).navigate('OKRTaskForm', { objectiveId, taskId: kr.id, parentId: kr.parent_id ?? undefined });
   };
 
   // Edit repeat target
@@ -520,21 +489,39 @@ export default function OKRDetailScreen() {
     const done = isKRDone(task);
     const childDone = children.filter(isKRDone).length;
     const isProgress = task.task_type === 'progress';
+    const isRepeat = task.repeat_mode === 1 && !isProgress;
+    const handleSubTaskPress = async () => {
+      if (isProgress) {
+        openProgressRecord(task);
+      } else if (isRepeat) {
+        try {
+          await incrementKR(task.id);
+          await refresh();
+        } catch (error) {
+          Alert.alert('暂时不能打卡', error instanceof Error ? error.message : '请稍后再试');
+        }
+      } else {
+        await toggleTaskComplete(task);
+      }
+    };
 
     return (
       <View key={task.id} style={[styles.subtaskBranch, level === 3 && styles.subtaskBranchLevel3]}>
         <View style={styles.subtaskRow}>
           <Pressable
-            accessibilityLabel={isProgress ? '添加进度记录' : done ? '标记为未完成' : '标记为完成'}
+            accessibilityLabel={isProgress ? '添加进度记录' : isRepeat ? '完成一次循环子任务' : done ? '标记为未完成' : '标记为完成'}
             accessibilityRole="button"
-            style={[styles.subCheckbox, isProgress && styles.progressAddButton, !isProgress && done && styles.subCheckboxDone]}
-            onPress={() => isProgress ? openProgressRecord(task) : toggleTaskComplete(task)}
+            style={[styles.subCheckbox, (isProgress || isRepeat) && styles.progressAddButton, !isProgress && !isRepeat && done && styles.subCheckboxDone]}
+            onPress={handleSubTaskPress}
+            disabled={isRepeat && done}
           >
-            <Text style={[styles.subCheckboxText, isProgress && styles.progressAddText]}>{isProgress ? '+' : done ? '✓' : ''}</Text>
+            <Text style={[styles.subCheckboxText, (isProgress || isRepeat) && styles.progressAddText]}>{isProgress || isRepeat ? '+' : done ? '✓' : ''}</Text>
           </Pressable>
           <View style={styles.subtaskContent}>
             <Text style={[styles.subName, done && styles.subNameDone]} numberOfLines={2}>{task.title}</Text>
             <View style={styles.subtaskMeta}>
+              {isRepeat && <Text style={styles.subtaskCount}>🔁 {task.current_value}/{task.target_value}</Text>}
+              {isProgress && <Text style={styles.subtaskCount}>{task.current_value}/{task.target_value}{task.unit ? ` ${task.unit}` : ''}</Text>}
               {children.length > 0 && <Text style={styles.subtaskCount}>⌘ {childDone}/{children.length}</Text>}
               {level < 3 && (
                 <Pressable onPress={() => openAddSubTask(task.id, level)} hitSlop={8}>
@@ -569,14 +556,24 @@ export default function OKRDetailScreen() {
   const renderTask = (kr: OKRKeyResult) => {
     const isProgress = kr.task_type === 'progress';
     const isRepeat = kr.repeat_mode === 1 && !isProgress;
-    const done = isKRDone(kr);
     const subs = subTasks[kr.id] || [];
+    const done = subs.length > 0
+      ? calcTaskDone(kr, allTasks) >= calcTaskQuantity(kr, allTasks)
+      : isKRDone(kr);
     const isExpanded = expandedTasks.has(kr.id);
     const subDoneCount = subs.filter((s) => s.current_value >= 1).length;
+    const displayedCurrent = subs.length > 0 ? calcTaskDone(kr, allTasks) : kr.current_value;
+    const displayedTarget = subs.length > 0 ? calcTaskQuantity(kr, allTasks) : kr.target_value;
+    const isRehabTrainingDay = title === '腿＋手腕居家康复（8周）'
+      && /^周[一二四五六]｜/.test(kr.title);
 
     const handleIncrement = async () => {
-      await incrementKR(kr.id);
-      refresh();
+      try {
+        await incrementKR(kr.id);
+        await refresh();
+      } catch (error) {
+        Alert.alert('暂时不能打卡', error instanceof Error ? error.message : '请稍后再试');
+      }
     };
 
     const handleToggleRepeat = async () => {
@@ -613,7 +610,7 @@ export default function OKRDetailScreen() {
                   style={[
                     styles.taskProgressFill,
                     done && styles.taskProgressFillDone,
-                    { width: `${Math.min(100, (kr.current_value / kr.target_value) * 100)}%` },
+                    { width: `${Math.min(100, displayedTarget > 0 ? (displayedCurrent / displayedTarget) * 100 : 0)}%` },
                   ]}
                 />
               </View>
@@ -622,10 +619,10 @@ export default function OKRDetailScreen() {
               <View style={styles.taskMetaRow}>
                 {isRepeat && <Pressable onPress={handleToggleRepeat}><Text style={styles.repeatIcon}>🔁</Text></Pressable>}
                 {isProgress && <Text style={styles.progressTypeLabel}>累计进度</Text>}
-                <Pressable onPress={() => { setEditTargetKR(kr); setEditTargetVal(String(kr.target_value)); }}>
+                <Pressable disabled={isRepeat || subs.length > 0} onPress={() => { setEditTargetKR(kr); setEditTargetVal(String(kr.target_value)); }}>
                   <Text style={styles.taskCount}>
-                    <Text style={styles.taskCountCurrent}>{kr.current_value}</Text>
-                    <Text style={styles.taskCountTotal}> / {kr.target_value}{kr.unit ? ` ${kr.unit}` : ''}</Text>
+                    <Text style={styles.taskCountCurrent}>{displayedCurrent}</Text>
+                    <Text style={styles.taskCountTotal}> / {displayedTarget}{kr.unit ? ` ${kr.unit}` : ''}</Text>
                   </Text>
                 </Pressable>
                 {subs.length > 0 && (
@@ -655,7 +652,7 @@ export default function OKRDetailScreen() {
               </View>
             )}
           </View>
-          {isRepeat && (
+          {isRepeat && subs.length === 0 && (
             <Pressable
               style={[styles.plusBtn, done && styles.plusBtnDone]}
               onPress={handleIncrement}
@@ -668,6 +665,14 @@ export default function OKRDetailScreen() {
           <Pressable
             onPress={() => {
               openActionSheet('更多操作', `「${kr.title}」`, [
+                ...(isRehabTrainingDay && isRepeat && subs.length > 0 ? [{ text: '🏸 按羽毛球方案完成', onPress: async () => {
+                  try {
+                    await completeRecurringTaskTree(kr.id);
+                    await refresh();
+                  } catch (error) {
+                    Alert.alert('暂时不能完成', error instanceof Error ? error.message : '请稍后再试');
+                  }
+                } }] : []),
                 { text: '✏️ 编辑任务', onPress: () => openEditTask(kr) },
                 { text: '✅ 永久完成', onPress: () => confirmCompletePermanently(kr) },
                 { text: '⏭ 顺延一天', onPress: () => confirmPostponeKR(kr) },
@@ -745,27 +750,9 @@ export default function OKRDetailScreen() {
               <Text style={styles.progressSub}>{krDoneCount}/{allTaskCount} 任务已完成</Text>
             </View>
             <View style={styles.progressBarRow}>
-              <Pressable
-                accessibilityLabel="减少一点目标进度"
-                style={[styles.progressStepBtn, (isInactive || overallProgress <= 0) && styles.progressStepBtnDisabled]}
-                onPress={handleTopDecrement}
-                disabled={isInactive || overallProgress <= 0}
-                hitSlop={6}
-              >
-                <Text style={[styles.progressStepText, (isInactive || overallProgress <= 0) && styles.progressStepTextDisabled]}>－</Text>
-              </Pressable>
               <View style={styles.progressBar}>
                 <View style={[styles.progressFill, allDone && styles.progressFillDone, { width: `${overallProgress}%` }]} />
               </View>
-              <Pressable
-                accessibilityLabel="增加一点目标进度"
-                style={[styles.progressStepBtn, (allDone || isInactive) && styles.progressStepBtnDisabled]}
-                onPress={handleTopIncrement}
-                disabled={allDone || isInactive}
-                hitSlop={6}
-              >
-                <Text style={[styles.progressStepText, (allDone || isInactive) && styles.progressStepTextDisabled]}>＋</Text>
-              </Pressable>
             </View>
           </View>
         </View>

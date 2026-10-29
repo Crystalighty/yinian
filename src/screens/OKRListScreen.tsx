@@ -16,9 +16,7 @@ import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import {
   deleteObjectiveOKR,
   getAllObjectivesWithProgress,
-  incrementKR,
-  listKeyResults,
-  updateKRProgress,
+  createRehabObjectiveTemplate,
   updateObjective,
 } from '../db/database';
 import { colors } from '../theme';
@@ -48,10 +46,8 @@ export default function OKRListScreen() {
   const [editObjVisible, setEditObjVisible] = useState(false);
   const [editObjId, setEditObjId] = useState<number | null>(null);
   const [editObjTitle, setEditObjTitle] = useState('');
-  const [incrVisible, setIncrVisible] = useState(false);
-  const [incrObjId, setIncrObjId] = useState<number | null>(null);
-  const [incrAmount, setIncrAmount] = useState('1');
   const [showCompleted, setShowCompleted] = useState(false);
+  const [creatingTemplate, setCreatingTemplate] = useState(false);
 
   const refresh = useCallback(async () => {
     const objs = await getAllObjectivesWithProgress();
@@ -96,41 +92,26 @@ export default function OKRListScreen() {
     refresh();
   };
 
-  const handleIncrement = async () => {
-    const amount = parseInt(incrAmount, 10);
-    if (!amount || amount <= 0 || !incrObjId) {
-      Alert.alert('提示', '请输入有效的数量');
-      return;
-    }
-    const krs = await listKeyResults(incrObjId);
-    let remaining = amount;
-    for (const kr of krs) {
-      if (remaining <= 0) break;
-      const canAdd = kr.target_value - kr.current_value;
-      if (canAdd > 0) {
-        const add = Math.min(canAdd, remaining);
-        for (let i = 0; i < add; i++) {
-          await incrementKR(kr.id);
-        }
-        remaining -= add;
-      }
-    }
-    setIncrVisible(false);
-    setIncrObjId(null);
-    setIncrAmount('1');
-    refresh();
-  };
-
-  const handleDecrementOne = async (objectiveId: number) => {
-    const krs = await listKeyResults(objectiveId);
-    const task = [...krs].reverse().find((kr) => Number(kr.current_value) > 0);
-    if (!task) return;
-    await updateKRProgress(task.id, Math.max(0, Number(task.current_value) - 1));
-    refresh();
-  };
-
   const activeObjectives = allObjectives.filter((o) => o.status !== 'completed');
   const completedObjectives = allObjectives.filter((o) => o.status === 'completed');
+
+  const createRehabTemplate = () => {
+    Alert.alert('创建8周康复计划', '将从今天开始，自动创建腿＋手腕康复目标及每周循环任务。周三、周日为休息日。', [
+      { text: '取消', style: 'cancel' },
+      { text: '创建', onPress: async () => {
+        try {
+          setCreatingTemplate(true);
+          const objectiveId = await createRehabObjectiveTemplate();
+          await refresh();
+          navigation.navigate('OKRDetail', { objectiveId, objectiveTitle: '腿＋手腕居家康复（8周）' });
+        } catch (error) {
+          Alert.alert('无法创建模板', error instanceof Error ? error.message : '请稍后重试');
+        } finally {
+          setCreatingTemplate(false);
+        }
+      } },
+    ]);
+  };
 
   return (
     <View style={styles.container}>
@@ -138,22 +119,70 @@ export default function OKRListScreen() {
         <View style={styles.pageHeader}>
           <View style={styles.pageHeading}>
             <Text style={styles.pageEyebrow}>MY GOALS</Text>
-            <Text style={styles.pageTitle}>目标管理</Text>
-            <Text style={styles.pageSubtitle}>{activeObjectives.length} 个进行中 · {completedObjectives.length} 个已达成</Text>
+            <View style={styles.titleRow}>
+              <Text style={styles.pageTitle}>目标管理</Text>
+              <Pressable
+                style={({ pressed }) => [styles.archiveBtn, showCompleted && styles.archiveBtnActive, pressed && styles.pressed]}
+                onPress={() => setShowCompleted((value) => !value)}
+              >
+                <Text style={[styles.archiveBtnText, showCompleted && styles.archiveBtnTextActive]}>
+                  {showCompleted ? '返回进行中' : `已完成目标 ${completedObjectives.length}`}
+                </Text>
+              </Pressable>
+            </View>
+            <Text style={styles.pageSubtitle}>{showCompleted ? `${completedObjectives.length} 个目标已归档` : `${activeObjectives.length} 个目标进行中`}</Text>
           </View>
-          <Pressable style={({ pressed }) => [styles.createBtn, pressed && styles.pressed]} onPress={() => navigation.navigate('OKRForm')}>
-            <Text style={styles.createBtnText}>＋</Text>
-          </Pressable>
+          {!showCompleted && <View style={styles.headerActions}>
+            <Pressable style={({ pressed }) => [styles.templateBtn, pressed && styles.pressed]} onPress={createRehabTemplate} disabled={creatingTemplate}>
+              <Text style={styles.templateBtnText}>{creatingTemplate ? '创建中' : '康复模板'}</Text>
+            </Pressable>
+            <Pressable style={({ pressed }) => [styles.createBtn, pressed && styles.pressed]} onPress={() => navigation.navigate('OKRForm')}>
+              <Text style={styles.createBtnText}>＋</Text>
+            </Pressable>
+          </View>}
         </View>
 
         {/* All Objectives */}
-        {activeObjectives.length === 0 && completedObjectives.length === 0 ? (
+        {showCompleted ? (
+          completedObjectives.length === 0 ? (
+            <View style={styles.emptyCard}>
+              <Text style={styles.emptyIcon}>🏆</Text>
+              <Text style={styles.emptyText}>还没有已完成的目标</Text>
+              <Text style={styles.emptySubtext}>完成的目标会自动归档到这里</Text>
+            </View>
+          ) : (
+            <View style={{ gap: 10 }}>
+              {completedObjectives.map((obj) => {
+                const progress = obj.progress ?? 0;
+                return (
+                  <Pressable
+                    key={obj.id}
+                    style={[styles.objCard, styles.completedCard]}
+                    onPress={() => navigation.navigate('OKRDetail', { objectiveId: obj.id, objectiveTitle: obj.title })}
+                    onLongPress={() => confirmDeleteObjective(obj.id, obj.title)}
+                  >
+                    <View style={styles.objTitleRow}>
+                      <Text style={[styles.objTitle, styles.completedTitle]} numberOfLines={1}>🏆 {obj.title}</Text>
+                    </View>
+                    <View style={styles.taskCountRow}>
+                      <Text style={styles.taskCountText}>{obj.kr_done}/{obj.kr_count} 任务已完成</Text>
+                    </View>
+                    <View style={styles.progressRow}>
+                      <View style={styles.progressTrack}>
+                        <View style={[styles.progressFill, { width: `${progress}%`, backgroundColor: colors.accent }]} />
+                        <Text style={[styles.progressPercentOverlay, { color: progress > 40 ? '#fff' : colors.accent }]}>{progress.toFixed(1)}%</Text>
+                      </View>
+                    </View>
+                  </Pressable>
+                );
+              })}
+            </View>
+          )
+        ) : activeObjectives.length === 0 ? (
           <View style={styles.emptyCard}>
-            <Text style={styles.emptyText}>还没有目标，点击上方按钮创建一个吧</Text>
+            <Text style={styles.emptyText}>还没有进行中的目标，点击上方按钮创建一个吧</Text>
           </View>
         ) : (
-          <>
-            {activeObjectives.length === 0 ? null : (
           <View style={{ gap: 10 }}>
             {activeObjectives.map((obj, idx) => {
               const remaining = getRemainingDays(obj.period_end_date);
@@ -211,83 +240,11 @@ export default function OKRListScreen() {
                         {progress.toFixed(1)}%
                       </Text>
                     </View>
-                    <View style={styles.progressStepActions}>
-                    <Pressable
-                      accessibilityLabel={`减少${obj.title}的进度`}
-                      style={[styles.incrBtn, { borderColor: colors.border }]}
-                      onPress={() => handleDecrementOne(obj.id)}
-                      hitSlop={6}
-                    >
-                      <Text style={[styles.incrBtnText, { color: colors.subtext }]}>－</Text>
-                    </Pressable>
-                    <Pressable
-                      accessibilityLabel={`增加${obj.title}的进度`}
-                      style={[styles.incrBtn, { borderColor: color }]}
-                      onPress={() => { setIncrObjId(obj.id); setIncrAmount('1'); setIncrVisible(true); }}
-                      hitSlop={6}
-                    >
-                      <Text style={[styles.incrBtnText, { color }]}>＋</Text>
-                    </Pressable>
-                    </View>
                   </View>
                 </Pressable>
               );
             })}
           </View>
-            )}
-
-            {/* Completed objectives toggle */}
-            {completedObjectives.length > 0 && (
-              <Pressable
-                style={styles.completedToggle}
-                onPress={() => setShowCompleted(!showCompleted)}
-              >
-                <Text style={styles.completedToggleText}>
-                  🏆 已达成目标（{completedObjectives.length}）
-                </Text>
-                <Text style={[styles.completedArrow, showCompleted && styles.completedArrowOpen]}>
-                  ⌄
-                </Text>
-              </Pressable>
-            )}
-
-            {/* Completed objectives list */}
-            {showCompleted && completedObjectives.length > 0 && (
-              <View style={{ gap: 10, marginTop: 10 }}>
-                {completedObjectives.map((obj, idx) => {
-                  const color = getObjColor(idx);
-                  const progress = obj.progress ?? 0;
-                  return (
-                    <Pressable
-                      key={obj.id}
-                      style={[styles.objCard, styles.completedCard]}
-                      onPress={() => navigation.navigate('OKRDetail', { objectiveId: obj.id, objectiveTitle: obj.title })}
-                      onLongPress={() => confirmDeleteObjective(obj.id, obj.title)}
-                    >
-                      <View style={styles.objTitleRow}>
-                        <Text style={[styles.objTitle, styles.completedTitle]} numberOfLines={1}>
-                          🎉 {obj.title}
-                        </Text>
-                      </View>
-                      <View style={styles.taskCountRow}>
-                        <Text style={styles.taskCountText}>
-                          {obj.kr_done}/{obj.kr_count} 任务已完成
-                        </Text>
-                      </View>
-                      <View style={styles.progressRow}>
-                        <View style={styles.progressTrack}>
-                          <View style={[styles.progressFill, { width: `${progress}%`, backgroundColor: colors.accent }]} />
-                          <Text style={[styles.progressPercentOverlay, { color: progress > 40 ? '#fff' : colors.accent }]}>
-                            {progress.toFixed(1)}%
-                          </Text>
-                        </View>
-                      </View>
-                    </Pressable>
-                  );
-                })}
-              </View>
-            )}
-          </>
         )}
       </ScrollView>
 
@@ -320,36 +277,6 @@ export default function OKRListScreen() {
         </KeyboardAvoidingView>
       </Modal>
 
-      {/* Increment Modal */}
-      <Modal visible={incrVisible} transparent animationType="slide">
-        <KeyboardAvoidingView style={styles.modalMask} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
-          <View style={styles.form}>
-            <View style={styles.formHeader}>
-              <Text style={styles.formTitle}>增加进度</Text>
-              <Pressable onPress={() => { setIncrVisible(false); setIncrObjId(null); setIncrAmount('1'); }}>
-                <Text style={styles.closeBtn}>×</Text>
-              </Pressable>
-            </View>
-            <Text style={{ fontSize: 13, color: colors.subtext }}>输入要完成的任务数量</Text>
-            <TextInput
-              style={styles.formInput}
-              placeholder="默认 1"
-              value={incrAmount}
-              onChangeText={setIncrAmount}
-              keyboardType="number-pad"
-              autoFocus
-            />
-            <View style={styles.formActions}>
-              <Pressable style={styles.cancelBtn} onPress={() => { setIncrVisible(false); setIncrObjId(null); setIncrAmount('1'); }}>
-                <Text style={styles.cancelBtnText}>取消</Text>
-              </Pressable>
-              <Pressable style={styles.saveBtn} onPress={handleIncrement}>
-                <Text style={styles.saveBtnText}>确认</Text>
-              </Pressable>
-            </View>
-          </View>
-        </KeyboardAvoidingView>
-      </Modal>
     </View>
   );
 }
@@ -360,9 +287,17 @@ const styles = StyleSheet.create({
   pageHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 13 },
   pageHeading: { flex: 1 },
   pageEyebrow: { fontSize: 10, color: colors.orange, fontWeight: '800', letterSpacing: 1.6, marginBottom: 5 },
+  titleRow: { flexDirection: 'row', alignItems: 'center', gap: 9 },
   pageTitle: { fontSize: 22, color: colors.text, fontWeight: '800', letterSpacing: -0.4 },
+  archiveBtn: { minHeight: 30, justifyContent: 'center', paddingHorizontal: 10, borderRadius: 10, backgroundColor: colors.surfaceMuted, borderWidth: 1, borderColor: colors.border },
+  archiveBtnActive: { backgroundColor: colors.primarySoft, borderColor: colors.primaryMuted },
+  archiveBtnText: { fontSize: 11, color: colors.subtext, fontWeight: '700' },
+  archiveBtnTextActive: { color: colors.orangeDark },
   pageSubtitle: { fontSize: 11, color: colors.subtext, marginTop: 3 },
   pressed: { opacity: 0.72, transform: [{ scale: 0.97 }] },
+  headerActions: { flexDirection: 'row', alignItems: 'center', gap: 7 },
+  templateBtn: { minHeight: 40, justifyContent: 'center', paddingHorizontal: 10, borderRadius: 12, backgroundColor: colors.primarySoft, borderWidth: 1, borderColor: colors.primaryMuted },
+  templateBtnText: { fontSize: 11, color: colors.orangeDark, fontWeight: '800' },
   // Create button
   createBtn: {
     backgroundColor: colors.orange,
@@ -393,7 +328,9 @@ const styles = StyleSheet.create({
     shadowRadius: 8,
     elevation: 1,
   },
+  emptyIcon: { fontSize: 28, marginBottom: 10 },
   emptyText: { fontSize: 14, color: colors.subtext, textAlign: 'center' },
+  emptySubtext: { fontSize: 11, color: colors.subtext, textAlign: 'center', marginTop: 6 },
   // Objective card
   objCard: {
     backgroundColor: colors.card,

@@ -12,7 +12,7 @@ import {
   View,
 } from 'react-native';
 import { useNavigation, useRoute } from '@react-navigation/native';
-import { addKeyResult, getKeyResult, getObjective, updateKeyResult } from '../db/database';
+import { addKeyResult, getKeyResult, getObjective, updateKeyResult, updateKRProgress } from '../db/database';
 import { colors } from '../theme';
 import DateTimePicker from '@react-native-community/datetimepicker';
 
@@ -59,6 +59,9 @@ export default function OKRTaskFormScreen() {
   const { objectiveId, taskId, parentId } = route.params as { objectiveId: number; taskId?: number; parentId?: number };
   const isEdit = !!taskId;
   const isSubTask = !!parentId;
+  const [inheritParentSchedule, setInheritParentSchedule] = useState(!!parentId && !taskId);
+  const [saving, setSaving] = useState(false);
+  const [loadedCurrentValue, setLoadedCurrentValue] = useState(0);
 
   // Objective dates for auto-fill
   const [objStartDate, setObjStartDate] = useState<string | null>(null);
@@ -116,6 +119,7 @@ export default function OKRTaskFormScreen() {
       getKeyResult(taskId).then((kr) => {
         if (kr) {
           setTaskType((kr.task_type as TaskType) || 'normal');
+          setInheritParentSchedule(kr.inherit_parent_schedule === 1);
           setTitle(kr.title);
           setNotes(kr.notes || '');
           
@@ -146,6 +150,7 @@ export default function OKRTaskFormScreen() {
           setTargetValue(String(kr.target_value || ''));
           setUnit(kr.unit || '');
           setStartValue(String(kr.current_value || 0));
+          setLoadedCurrentValue(Number(kr.current_value || 0));
           setMinDailyAmount(kr.min_daily_amount > 0 ? String(kr.min_daily_amount) : '');
           if (kr.reminder_time) {
             setReminderEnabled(true);
@@ -156,8 +161,31 @@ export default function OKRTaskFormScreen() {
           }
         }
       });
+    } else if (parentId) {
+      // New subtasks inherit the parent's schedule by default. The user can
+      // still edit the inherited values before saving when a different rhythm
+      // is needed for this particular subtask.
+      getKeyResult(parentId).then((parent) => {
+        if (!parent) return;
+        const parentRecurrence = (parent.recurrence || 'none') as Recurrence;
+        setRecurrence(parentRecurrence);
+        if (parent.start_date && parent.end_date) {
+          setUseObjDates(false);
+          setDateEnabled(true);
+          setStartDate(new Date(`${parent.start_date}T00:00:00`));
+          setEndDate(new Date(`${parent.end_date}T00:00:00`));
+        }
+        if (parentRecurrence === 'weekly' && parent.recurrence_days) {
+          setSelectedWeekDays(new Set(parent.recurrence_days.split(',').map(Number)));
+        } else if (parentRecurrence === 'monthly' && parent.recurrence_days) {
+          setMonthlyDays(parent.recurrence_days);
+        }
+        if (parent.task_type === 'progress') {
+          setResetCycle((parent.reset_cycle as ResetCycle) || 'none');
+        }
+      });
     }
-  }, [objectiveId, taskId]);
+  }, [objectiveId, taskId, parentId]);
 
   // Auto-calc min daily amount
   useEffect(() => {
@@ -173,14 +201,15 @@ export default function OKRTaskFormScreen() {
     navigation.setOptions({
       title: isEdit ? '编辑任务' : '新建任务',
       headerRight: () => (
-        <Pressable onPress={handleSave} hitSlop={8}>
-          <Text style={{ color: colors.orange, fontSize: 16, fontWeight: '600' }}>{isEdit ? '保存' : '完成'}</Text>
+        <Pressable onPress={handleSave} hitSlop={8} disabled={saving}>
+          <Text style={{ color: colors.orange, fontSize: 16, fontWeight: '600', opacity: saving ? 0.5 : 1 }}>{saving ? '保存中…' : isEdit ? '保存' : '完成'}</Text>
         </Pressable>
       ),
     });
   });
 
   const handleSave = async () => {
+    if (saving) return;
     if (!title.trim()) {
       Alert.alert('提示', '任务名称不能为空');
       return;
@@ -189,7 +218,10 @@ export default function OKRTaskFormScreen() {
     let sd: string | null = null;
     let ed: string | null = null;
     
-    if (dateEnabled) {
+    if (useObjDates && objStartDate && objEndDate) {
+      sd = objStartDate;
+      ed = objEndDate;
+    } else if (dateEnabled) {
       sd = fmtDate(startDate);
       ed = fmtDate(endDate);
     }
@@ -202,41 +234,94 @@ export default function OKRTaskFormScreen() {
       recurrenceDays = monthlyDays.trim();
     }
 
+    if (taskType === 'normal' && recurrence !== 'none' && (!sd || !ed)) {
+      Alert.alert('提示', '循环任务需要设置开始和结束日期');
+      return;
+    }
+    if (sd && ed && sd > ed) {
+      Alert.alert('提示', '结束日期不能早于开始日期');
+      return;
+    }
+    if (taskType === 'normal' && recurrence === 'weekly' && selectedWeekDays.size === 0) {
+      Alert.alert('提示', '请至少选择一个星期');
+      return;
+    }
+    if (taskType === 'normal' && recurrence === 'monthly') {
+      const days = monthlyDays.split(',').map((value) => Number(value.trim())).filter(Number.isFinite);
+      if (days.length === 0 || days.some((day) => day < 1 || day > 31)) {
+        Alert.alert('提示', '请输入 1 到 31 之间的有效日期');
+        return;
+      }
+    }
     const repeatMode = recurrence !== 'none' ? 1 : 0;
-    const tv = taskType === 'progress' ? (parseFloat(targetValue) || 1) : 1;
+    const normalTarget = (() => {
+      if (recurrence === 'none' || !sd || !ed) return 1;
+      const start = new Date(`${sd}T00:00:00`);
+      const end = new Date(`${ed}T00:00:00`);
+      let count = 0;
+      for (const cursor = new Date(start); cursor <= end; cursor.setDate(cursor.getDate() + 1)) {
+        const weekday = cursor.getDay() || 7;
+        if (recurrence === 'daily' ||
+            (recurrence === 'weekday' && weekday <= 5) ||
+            (recurrence === 'weekend' && weekday >= 6) ||
+            (recurrence === 'weekly' && selectedWeekDays.has(weekday)) ||
+            (recurrence === 'monthly' && monthlyDays.split(',').map(Number).includes(cursor.getDate()))) count++;
+      }
+      if (recurrence === 'ebbinghaus') {
+        const availableDays = calcDaysBetween(sd, ed);
+        return [1, 2, 4, 7, 15, 30].filter((day) => day <= availableDays).length || 1;
+      }
+      return Math.max(1, count);
+    })();
+    const tv = taskType === 'progress' ? (parseFloat(targetValue) || 1) : normalTarget;
     const reminder = reminderEnabled
       ? `${pad(reminderTime.getHours())}:${pad(reminderTime.getMinutes())}`
       : null;
 
-    if (isEdit && taskId) {
-      await updateKeyResult(taskId, title.trim(), tv, taskType === 'progress' ? unit : '', null, null, repeatMode, {
-        taskType,
-        notes: notes.trim() || null,
-        startDate: sd,
-        endDate: ed,
-        recurrence,
-        recurrenceDays,
-        reminderTime: reminder,
-        resetCycle: taskType === 'progress' ? resetCycle : 'none',
-        minDailyAmount: taskType === 'progress' ? (parseFloat(minDailyAmount) || 0) : 0,
-      });
-    } else {
-      await addKeyResult(objectiveId, title.trim(), tv, taskType === 'progress' ? unit : '', null, null, repeatMode, parentId || null, {
-        taskType,
-        notes: notes.trim() || null,
-        startDate: sd,
-        endDate: ed,
-        recurrence,
-        recurrenceDays,
-        reminderTime: reminder,
-        resetCycle: taskType === 'progress' ? resetCycle : 'none',
-        minDailyAmount: taskType === 'progress' ? (parseFloat(minDailyAmount) || 0) : 0,
-      });
+    setSaving(true);
+    try {
+      if (isEdit && taskId) {
+        await updateKeyResult(taskId, title.trim(), tv, taskType === 'progress' ? unit : '', null, null, repeatMode, {
+          taskType,
+          notes: notes.trim() || null,
+          startDate: sd,
+          endDate: ed,
+          recurrence,
+          recurrenceDays,
+          reminderTime: reminder,
+          resetCycle: taskType === 'progress' ? resetCycle : 'none',
+          minDailyAmount: taskType === 'progress' ? (parseFloat(minDailyAmount) || 0) : 0,
+          inheritParentSchedule,
+        });
+        const nextCurrentValue = Math.max(0, Math.min(tv, parseFloat(startValue) || 0));
+        if (taskType === 'progress' && nextCurrentValue !== loadedCurrentValue) {
+          await updateKRProgress(taskId, nextCurrentValue);
+        }
+      } else {
+        await addKeyResult(objectiveId, title.trim(), tv, taskType === 'progress' ? unit : '', null, null, repeatMode, parentId || null, {
+          taskType,
+          notes: notes.trim() || null,
+          startDate: sd,
+          endDate: ed,
+          recurrence,
+          recurrenceDays,
+          reminderTime: reminder,
+          resetCycle: taskType === 'progress' ? resetCycle : 'none',
+          minDailyAmount: taskType === 'progress' ? (parseFloat(minDailyAmount) || 0) : 0,
+          initialValue: taskType === 'progress' ? (parseFloat(startValue) || 0) : 0,
+          inheritParentSchedule,
+        });
+      }
+      navigation.goBack();
+    } catch (error) {
+      Alert.alert('保存失败', error instanceof Error ? error.message : '请稍后重试');
+    } finally {
+      setSaving(false);
     }
-    navigation.goBack();
   };
 
   const toggleWeekDay = (day: number) => {
+    if (isSubTask) setInheritParentSchedule(false);
     setSelectedWeekDays((prev) => {
       const next = new Set(prev);
       if (next.has(day)) next.delete(day);
@@ -279,6 +364,7 @@ export default function OKRTaskFormScreen() {
           <Switch 
             value={useObjDates} 
             onValueChange={(v) => {
+              if (isSubTask) setInheritParentSchedule(false);
               setUseObjDates(v);
               if (v && objStartDate && objEndDate) {
                 // Sync objective dates to form and enable date editing
@@ -295,7 +381,7 @@ export default function OKRTaskFormScreen() {
           <>
             <View style={styles.switchRow}>
               <Text style={styles.label}>设置日期</Text>
-              <Switch value={dateEnabled} onValueChange={setDateEnabled} trackColor={{ false: colors.border, true: colors.orange + '60' }} thumbColor={dateEnabled ? colors.orange : colors.subtext} />
+              <Switch value={dateEnabled} onValueChange={(value) => { if (isSubTask) setInheritParentSchedule(false); setDateEnabled(value); }} trackColor={{ false: colors.border, true: colors.orange + '60' }} thumbColor={dateEnabled ? colors.orange : colors.subtext} />
             </View>
             {dateEnabled && (
               <>
@@ -305,7 +391,7 @@ export default function OKRTaskFormScreen() {
                   <Text style={styles.dateBtnIcon}>📅</Text>
                 </Pressable>
                 {showStartPicker && (
-                  <DateTimePicker value={startDate} mode="date" display={Platform.OS === 'ios' ? 'compact' : 'default'} onChange={(_e: any, d?: Date) => { setShowStartPicker(false); if (d) setStartDate(d); }} />
+                  <DateTimePicker value={startDate} mode="date" display={Platform.OS === 'ios' ? 'compact' : 'default'} onChange={(_e: any, d?: Date) => { setShowStartPicker(false); if (d) { if (isSubTask) setInheritParentSchedule(false); setStartDate(d); } }} />
                 )}
                 <Text style={styles.subLabel}>结束日期</Text>
                 <Pressable style={styles.dateBtn} onPress={() => setShowEndPicker(true)}>
@@ -313,7 +399,7 @@ export default function OKRTaskFormScreen() {
                   <Text style={styles.dateBtnIcon}>📅</Text>
                 </Pressable>
                 {showEndPicker && (
-                  <DateTimePicker value={endDate} mode="date" display={Platform.OS === 'ios' ? 'compact' : 'default'} onChange={(_e: any, d?: Date) => { setShowEndPicker(false); if (d) setEndDate(d); }} />
+                  <DateTimePicker value={endDate} mode="date" display={Platform.OS === 'ios' ? 'compact' : 'default'} onChange={(_e: any, d?: Date) => { setShowEndPicker(false); if (d) { if (isSubTask) setInheritParentSchedule(false); setEndDate(d); } }} />
                 )}
               </>
             )}
@@ -329,13 +415,22 @@ export default function OKRTaskFormScreen() {
         {/* Recurrence (normal task only) */}
         {taskType === 'normal' && (
           <>
+            {isSubTask && (
+              <View style={styles.switchRow}>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.label}>跟随父任务周期</Text>
+                  <Text style={styles.hintText}>父任务修改循环规则时同步更新</Text>
+                </View>
+                <Switch value={inheritParentSchedule} onValueChange={setInheritParentSchedule} trackColor={{ false: colors.border, true: colors.orange + '60' }} thumbColor={inheritParentSchedule ? colors.orange : colors.subtext} />
+              </View>
+            )}
             <Text style={styles.label}>循环</Text>
             <View style={styles.chipRow}>
               {RECURRENCE_OPTIONS.map((opt) => (
                 <Pressable
                   key={opt.key}
                   style={[styles.chip, recurrence === opt.key && styles.chipActive]}
-                  onPress={() => setRecurrence(opt.key)}
+                  onPress={() => { if (isSubTask) setInheritParentSchedule(false); setRecurrence(opt.key); }}
                 >
                   <Text style={[styles.chipText, recurrence === opt.key && styles.chipTextActive]}>{opt.label}</Text>
                 </Pressable>
@@ -357,7 +452,7 @@ export default function OKRTaskFormScreen() {
             {recurrence === 'monthly' && (
               <>
                 <Text style={styles.subLabel}>每月日期（逗号分隔，如 1,15）</Text>
-                <TextInput style={styles.input} placeholder="如 1,15" value={monthlyDays} onChangeText={setMonthlyDays} keyboardType="numbers-and-punctuation" />
+                <TextInput style={styles.input} placeholder="如 1,15" value={monthlyDays} onChangeText={(value) => { if (isSubTask) setInheritParentSchedule(false); setMonthlyDays(value); }} keyboardType="numbers-and-punctuation" />
               </>
             )}
             {recurrence === 'ebbinghaus' && (
